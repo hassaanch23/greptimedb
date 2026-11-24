@@ -16,11 +16,11 @@ use std::collections::HashMap;
 use std::fmt;
 
 use common_telemetry::{debug, error, info, warn};
-use futures::TryStreamExt;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
-use crate::error::{Result, ToJsonSnafu};
+use crate::error::{Error, Result, ToJsonSnafu};
 pub(crate) use crate::store::state_store::StateStoreRef;
 use crate::{ProcedureContext, ProcedureId, SubprocedureRecovery};
 
@@ -203,17 +203,23 @@ impl ProcedureStore {
         // 8 should be enough for most procedures.
         let mut step_keys = Vec::with_capacity(8);
         let mut finish_keys = Vec::new();
-        while let Some((key_set, _)) = key_values.try_next().await? {
-            let key = key_set.key();
-            let Some(curr_key) = ParsedKey::parse_str(&self.proc_path, key) else {
+        while let Some(record) = key_values.next().await {
+            let (key, keys) = match record {
+                Ok((key_set, _)) => (key_set.key().to_owned(), key_set.keys()),
+                Err(Error::IncompleteRecord {
+                    key, present_keys, ..
+                }) => (key, present_keys),
+                Err(e) => return Err(e),
+            };
+            let Some(curr_key) = ParsedKey::parse_str(&self.proc_path, &key) else {
                 warn!("Unknown key while deleting procedures, key: {}", key);
                 continue;
             };
             if curr_key.key_type == KeyType::Step {
-                step_keys.extend(key_set.keys());
+                step_keys.extend(keys);
             } else {
                 // .commit or .rollback
-                finish_keys.extend(key_set.keys());
+                finish_keys.extend(keys);
             }
         }
 
@@ -236,12 +242,20 @@ impl ProcedureStore {
     /// Load procedures from the storage.
     pub(crate) async fn load_messages(&self) -> Result<ProcedureMessages> {
         // Track the key-value pair by procedure id.
-        let mut procedure_key_values: HashMap<_, (ParsedKey, Vec<u8>)> = HashMap::new();
+        let mut procedure_key_values: HashMap<_, (ParsedKey, Option<Vec<u8>>)> = HashMap::new();
 
         // Scan all procedures.
         let mut key_values = self.store.walk_top_down(&self.proc_path).await?;
-        while let Some((key_set, value)) = key_values.try_next().await? {
-            let key = key_set.key();
+        while let Some(record) = key_values.next().await {
+            let (key, value) = match record {
+                Ok((key, value)) => (key, Some(value)),
+                Err(Error::IncompleteRecord { key, reason, .. }) => {
+                    error!("Incomplete procedure checkpoint {key}: {reason}");
+                    (state_store::KeySet::new(key, 0), None)
+                }
+                Err(e) => return Err(e),
+            };
+            let key = key.key();
             let Some(curr_key) = ParsedKey::parse_str(&self.proc_path, key) else {
                 warn!("Unknown key while loading procedures, key: {}", key);
                 continue;
@@ -261,6 +275,8 @@ impl ProcedureStore {
         let mut rollback_messages = HashMap::new();
         let mut finished_ids = Vec::new();
         for (procedure_id, (parsed_key, value)) in procedure_key_values {
+            // An incomplete latest step must not replay an earlier checkpoint.
+            let Some(value) = value else { continue };
             match parsed_key.key_type {
                 KeyType::Step => {
                     let Some(message) = self.load_one_message(&parsed_key, &value) else {
@@ -754,6 +770,84 @@ mod tests {
         assert!(messages.is_empty());
         assert!(rollback_messages.is_empty());
         assert!(finished_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_recovery_with_incomplete_records() {
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+
+        use state_store::{KeyValueStream, StateStore};
+
+        #[derive(Default)]
+        struct SegmentedStore(Mutex<BTreeMap<String, Vec<u8>>>);
+
+        #[async_trait]
+        impl StateStore for SegmentedStore {
+            async fn put(&self, key: &str, value: Vec<u8>) -> Result<()> {
+                self.0.lock().unwrap().insert(key.to_owned(), value);
+                Ok(())
+            }
+
+            async fn walk_top_down(&self, prefix: &str) -> Result<KeyValueStream> {
+                let rows: Vec<_> = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(prefix))
+                    .map(|(key, value)| Ok((key.clone(), value.clone())))
+                    .collect();
+                Ok(Box::pin(util::multiple_value_stream(Box::pin(
+                    futures::stream::iter(rows),
+                ))))
+            }
+
+            async fn batch_delete(&self, keys: &[String]) -> Result<()> {
+                let mut kv = self.0.lock().unwrap();
+                for key in keys {
+                    kv.remove(key);
+                }
+                Ok(())
+            }
+
+            async fn delete(&self, key: &str) -> Result<()> {
+                self.0.lock().unwrap().remove(key);
+                Ok(())
+            }
+        }
+
+        let kv = Arc::new(SegmentedStore::default());
+        let store = ProcedureStore::new("", kv.clone());
+        let incomplete = ProcedureId::random();
+        let resumed = ProcedureId::random();
+        let finished = ProcedureId::random();
+        for id in [incomplete, resumed, finished] {
+            store
+                .store_procedure(id, 0, "mock".into(), "old".into(), None)
+                .await
+                .unwrap();
+            let key = proc_path!(store, "{id}/0000000001.step/0000000002");
+            kv.put(&key, vec![3]).await.unwrap();
+        }
+        store
+            .store_procedure(resumed, 2, "mock".into(), "new".into(), None)
+            .await
+            .unwrap();
+        store.commit_procedure(finished, 2).await.unwrap();
+        let messages = store.load_messages().await.unwrap();
+        assert_eq!(messages.messages.len(), 1);
+        assert_eq!(messages.messages[&resumed].data, "new");
+        assert_eq!(messages.finished_ids, [finished]);
+        assert!(messages.rollback_messages.is_empty());
+
+        store.delete_procedure(finished).await.unwrap();
+        let rows = kv.0.lock().unwrap();
+        assert!(!rows.keys().any(|key| key.contains(&finished.to_string())));
+        assert!(rows.contains_key(&proc_path!(
+            store,
+            "{incomplete}/0000000001.step/0000000002"
+        )));
     }
 
     #[tokio::test]

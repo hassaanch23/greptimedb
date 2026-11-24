@@ -211,13 +211,14 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("Failed to parse segment key: {key}"))]
-    ParseSegmentKey {
+    #[snafu(display("Incomplete procedure record {key}: {reason}"))]
+    IncompleteRecord {
+        key: String,
+        reason: String,
+        /// Physical keys still present, for cleanup after a later completed step.
+        present_keys: Vec<String>,
         #[snafu(implicit)]
         location: Location,
-        key: String,
-        #[snafu(source)]
-        error: std::num::ParseIntError,
     },
 
     #[snafu(display("Unexpected: {err_msg}"))]
@@ -281,7 +282,7 @@ impl ErrorExt for Error {
                 StatusCode::InvalidArguments
             }
             Error::ProcedurePanic { .. }
-            | Error::ParseSegmentKey { .. }
+            | Error::IncompleteRecord { .. }
             | Error::Unexpected { .. }
             | &Error::ProcedureNotFound { .. }
             | Error::PoisonKeyNotDefined { .. } => StatusCode::Unexpected,
