@@ -1610,6 +1610,7 @@ mod tests {
             pending_tails: Default::default(),
             series_indexes: Default::default(),
             handoff_floors: Default::default(),
+            table_compaction_receipts: Default::default(),
         }
     }
 

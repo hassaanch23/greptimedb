@@ -9,7 +9,7 @@
 // distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
 // either express or implied.
 
-//! At-least-once requests, conditional file publication, no durable task state.
+//! Conditional publication of data files and their region-local completion receipt.
 
 use std::collections::HashSet;
 
@@ -89,7 +89,15 @@ fn is_current(
     manifest: &RegionManifest,
 ) -> bool {
     let current = region.version_control.current();
-    is_table_compaction_metadata_compatible(&context.metadata, &manifest.metadata)
+    edit.table_compaction_receipt
+        .as_ref()
+        .is_none_or(|receipt| {
+            manifest
+                .table_compaction_receipts
+                .get(&receipt.job_id)
+                .is_none()
+        })
+        && is_table_compaction_metadata_compatible(&context.metadata, &manifest.metadata)
         && context.options == current.version.options
         && !edit.files_to_remove.is_empty()
         && edit

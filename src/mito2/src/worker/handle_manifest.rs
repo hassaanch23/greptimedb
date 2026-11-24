@@ -140,6 +140,7 @@ impl RegionEditQueue {
             can_merge(request)
                 && std::mem::discriminant(&request.kind) == std::mem::discriminant(&merged.kind)
                 && request.staging_partition_expr == merged.staging_partition_expr
+                && request.preload_sst_cache == merged.preload_sst_cache
         }) {
             merged.edit.files_to_add.extend(request.edit.files_to_add);
             merged.waiters.merge(request.waiters);
@@ -1260,6 +1261,37 @@ mod tests {
                 second.waiters.reply_with(|| Ok(()));
                 assert!(receivers[1].try_recv().unwrap().is_ok());
             }
+            assert!(queue.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_edit_queue_preserves_cache_preload_policy() {
+        for policies in [[false, true], [true, false], [true, true], [false, false]] {
+            let id = RegionId::new(1, 1);
+            let mut queue = RegionEditQueue::new(id);
+            let mut receivers = Vec::new();
+            for preload in policies {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                queue.enqueue(RegionEditRequest::new(
+                    id,
+                    RegionEdit::default(),
+                    preload,
+                    tx,
+                ));
+                receivers.push(rx);
+            }
+            let first = queue.dequeue().unwrap();
+            assert_eq!(first.preload_sst_cache, policies[0]);
+            first.waiters.reply_with(|| Ok(()));
+            assert!(receivers[0].try_recv().unwrap().is_ok());
+            if policies[0] != policies[1] {
+                assert!(receivers[1].try_recv().is_err());
+                let second = queue.dequeue().unwrap();
+                assert_eq!(second.preload_sst_cache, policies[1]);
+                second.waiters.reply_with(|| Ok(()));
+            }
+            assert!(receivers[1].try_recv().unwrap().is_ok());
             assert!(queue.is_empty());
         }
     }

@@ -28,11 +28,11 @@ use crate::error::{
     Error, InvalidRequestSnafu, RecvSnafu, RegionBusySnafu, RegionNotFoundSnafu, Result,
     SerdeJsonSnafu,
 };
-use crate::manifest::action::RegionEdit;
+use crate::manifest::action::{RegionEdit, TableCompactionReceipt};
 use crate::region::options::RegionOptions;
 use crate::region::{RegionLeaderState, RegionRoleState};
 use crate::request::{RegionEditKind, RegionEditRequest, WorkerRequest};
-use crate::sst::file::{FileMeta, SHARED_LEVEL_SLOT};
+use crate::sst::file::{FileMeta, LEVEL_SHARED, SHARED_LEVEL_SLOT};
 
 /// A query-visible input snapshot. Callers may select a subset of `inputs` for a job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +100,30 @@ pub fn is_table_compaction_metadata_compatible(
 }
 
 impl MitoEngine {
+    /// Installs shared ingestion references using the ingestion cache policy.
+    /// Keep import accounting: the same SST is referenced by multiple targets
+    /// and must not be counted as fresh writes at every target.
+    pub async fn ingest_shared_ssts(&self, region_id: RegionId, edit: RegionEdit) -> Result<()> {
+        ensure!(
+            edit.files_to_remove.is_empty()
+                && edit
+                    .files_to_add
+                    .iter()
+                    .all(|file| file.level == LEVEL_SHARED),
+            InvalidRequestSnafu {
+                region_id,
+                reason: "Shared ingestion requires shared files and cannot remove files"
+            }
+        );
+        self.edit_region_with_kind(
+            region_id,
+            edit,
+            RegionEditKind::Import,
+            *super::INGEST_PRELOAD_SST_CACHE,
+        )
+        .await
+    }
+
     /// Reads a committed version without waiting for manifest work to become idle.
     /// Publication revalidates the selected inputs, metadata and options in the worker.
     pub fn table_compaction_snapshot(
@@ -183,6 +207,31 @@ impl MitoEngine {
         snapshot: TableCompactionSnapshot,
         outputs: Vec<FileMeta>,
     ) -> Result<PublicationOutcome> {
+        self.publish_table_compaction_with_receipt(region_id, snapshot, outputs, None)
+            .await
+    }
+
+    /// Reads the persisted receipt even if the job's output files have since been compacted.
+    pub async fn table_compaction_receipt(
+        &self,
+        region_id: RegionId,
+        job_id: uuid::Uuid,
+    ) -> Result<Option<[u8; 32]>> {
+        let region = self
+            .find_region(region_id)
+            .context(RegionNotFoundSnafu { region_id })?;
+        let manifest = region.manifest_ctx.manifest().await;
+        Ok(manifest.table_compaction_receipts.get(&job_id).copied())
+    }
+
+    /// Applies the edit and its optional idempotency receipt in one manifest version.
+    pub async fn publish_table_compaction_with_receipt(
+        &self,
+        region_id: RegionId,
+        snapshot: TableCompactionSnapshot,
+        outputs: Vec<FileMeta>,
+        receipt: Option<TableCompactionReceipt>,
+    ) -> Result<PublicationOutcome> {
         ensure!(
             snapshot.metadata.region_id == region_id && !snapshot.inputs.is_empty(),
             InvalidRequestSnafu {
@@ -194,6 +243,7 @@ impl MitoEngine {
         // worker compares typed options and reads typed flags without reparsing.
         let options = serde_json::from_value(snapshot.options).context(SerdeJsonSnafu)?;
         let edit = RegionEdit {
+            table_compaction_receipt: receipt,
             files_to_remove: snapshot.inputs,
             files_to_add: outputs,
             timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),

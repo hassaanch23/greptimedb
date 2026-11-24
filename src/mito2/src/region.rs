@@ -1096,12 +1096,13 @@ impl MitoRegion {
 
     /// Returns the file metas of the region by file ids.
     pub async fn file_metas(&self, file_ids: &[FileId]) -> Vec<Option<FileMeta>> {
-        let manifest_files = self.manifest_ctx.manifest().await.files.clone();
+        let manifest = self.manifest_ctx.manifest().await;
 
         file_ids
             .iter()
             .map(|file_id| {
-                manifest_files
+                manifest
+                    .files
                     .get(file_id)
                     .map(|meta| meta.as_ref().clone())
             })

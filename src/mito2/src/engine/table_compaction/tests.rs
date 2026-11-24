@@ -747,17 +747,49 @@ async fn test_empty_target_replacement_preserves_other_shared_reference() {
     let region = engine.get_region(target).unwrap();
     assert_eq!(1, region.version_control.current().last_sequence);
     assert_eq!(0, row_count(&engine, target).await);
+    let applied = crate::manifest::action::TableCompactionReceipt {
+        job_id: uuid::Uuid::new_v4(),
+        digest: [7; 32],
+    };
+    let competing = crate::manifest::action::TableCompactionReceipt {
+        job_id: uuid::Uuid::new_v4(),
+        digest: [8; 32],
+    };
     assert_eq!(
         PublicationOutcome::Applied,
         engine
-            .publish_table_compaction(target, snapshot.clone(), vec![])
+            .publish_table_compaction_with_receipt(
+                target,
+                snapshot.clone(),
+                vec![],
+                Some(applied.clone())
+            )
             .await
             .unwrap()
     );
     assert_eq!(
         PublicationOutcome::StaleInputs,
         engine
-            .publish_table_compaction(target, snapshot, vec![])
+            .publish_table_compaction_with_receipt(
+                target,
+                snapshot,
+                vec![],
+                Some(competing.clone())
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        Some(applied.digest),
+        engine
+            .table_compaction_receipt(target, applied.job_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        None,
+        engine
+            .table_compaction_receipt(target, competing.job_id)
             .await
             .unwrap()
     );

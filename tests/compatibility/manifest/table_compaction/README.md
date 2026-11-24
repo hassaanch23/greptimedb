@@ -4,15 +4,13 @@ The hand-authored frozen fixtures use the JSON schema of `RegionEdit` and
 `RegionManifest` at `4092fe6549`. They are schema fixtures, not captures from a
 released binary. They preserve L0/L1 metadata, sequences and flush boundaries.
 
-V1 publishes compaction results using ordinary file edits. It adds no task IDs,
-phases, receipts, request epochs or extension-state fields to the manifest.
-Task retries may be submitted more than once; publication checks current inputs.
-The Enterprise `publish_table_compaction` API consumes a query-visible input
-snapshot and returns `Applied` or `StaleInputs`. A stale attempt must re-snapshot
-and replan, never re-import its old inputs. Even stale/error outcomes must not
-trigger blind output deletion: an earlier attempt may already have published
-those objects. Callers retain output protection until recovery or GC resolves
-liveness.
+Legacy readers can still deserialize file edits. A new publication optionally includes
+a job ID and a digest in the same edit as its files (`publication-edit.json`).
+Checkpoints retain the last 4096 distinct publications per region. Replaying an
+identical edit leaves its position unchanged. If the receipt has expired, a retry
+must revalidate the inputs and cannot claim this job succeeded from missing inputs
+alone. Older binaries can open the files but do not maintain the new receipt field.
+Callers retain output protection until recovery or GC resolves liveness.
 
 Publication tests (including partial success, lost ACKs and reopened regions):
 

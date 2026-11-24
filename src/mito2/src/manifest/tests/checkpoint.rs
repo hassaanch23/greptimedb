@@ -237,6 +237,61 @@ async fn wal_recovery_records_survive_reopen(#[case] checkpoint_distance: u64) {
     assert_eq!(manifest.committed_sequence, Some(1 << 40));
 }
 
+#[rstest::rstest]
+#[case(0)]
+#[case(1)]
+#[tokio::test]
+async fn table_compaction_receipt_survives_reopen(#[case] checkpoint_distance: u64) {
+    use crate::manifest::action::TableCompactionReceipt;
+    let (env, mut manager) =
+        build_manager(checkpoint_distance, CompressionType::Uncompressed).await;
+    let job_id = uuid::Uuid::from_u128(42);
+    let actions = RegionMetaActionList::decode(include_bytes!(
+        "../../../../../tests/compatibility/manifest/table_compaction/publication-edit.json"
+    ))
+    .unwrap();
+    let RegionMetaAction::Edit(edit) = &actions.actions[0] else {
+        panic!("expected file edit")
+    };
+    let file_ids = edit
+        .files_to_add
+        .iter()
+        .map(|f| f.file_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        edit.table_compaction_receipt,
+        Some(TableCompactionReceipt {
+            job_id,
+            digest: [3; 32]
+        })
+    );
+    manager.update(actions, false).await.unwrap();
+    wait_for_manifest_checkpoint(&manager).await;
+    assert_eq!(
+        manager
+            .store()
+            .load_last_checkpoint()
+            .await
+            .unwrap()
+            .is_some(),
+        checkpoint_distance > 0
+    );
+    manager.stop().await;
+
+    let manifest = reopen_manager(&env, checkpoint_distance, CompressionType::Uncompressed)
+        .await
+        .manifest();
+    assert_eq!(
+        manifest.table_compaction_receipts.get(&job_id),
+        Some(&[3; 32])
+    );
+    assert!(
+        file_ids
+            .iter()
+            .all(|file_id| manifest.files.contains_key(file_id))
+    );
+}
+
 #[tokio::test]
 async fn test_corrupted_data_causing_checksum_error() {
     // Initialize manager

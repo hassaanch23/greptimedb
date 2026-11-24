@@ -516,6 +516,7 @@ pub(super) async fn run_direct_sst(args: DirectArgs) {
         pending_tails: Default::default(),
         series_indexes: Default::default(),
         handoff_floors: Default::default(),
+        table_compaction_receipts: Default::default(),
     };
     let checkpoint = RegionCheckpoint {
         last_version: args.checkpoint_version,

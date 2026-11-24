@@ -14,7 +14,8 @@
 
 //! Defines [RegionMetaAction] related structs and [RegionCheckpoint].
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -25,6 +26,7 @@ use store_api::ManifestVersion;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{FileId, IndexVersion, RegionId, SequenceNumber};
 use strum::Display;
+use uuid::Uuid;
 
 use crate::error::{RegionMetadataNotFoundSnafu, Result, SerdeJsonSnafu, Utf8Snafu};
 use crate::manifest::manager::RemoveFileOptions;
@@ -100,8 +102,50 @@ pub struct RegionEdit {
     pub flushed_entry_id: Option<EntryId>,
     pub flushed_sequence: Option<SequenceNumber>,
     pub committed_sequence: Option<SequenceNumber>,
+    /// Publication identity committed atomically with the input/output file edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_compaction_receipt: Option<TableCompactionReceipt>,
     #[serde(flatten)]
     pub wal_recovery: WalRecoveryEdit,
+}
+
+/// Identifies the exact table-compaction publication applied to this region.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TableCompactionReceipt {
+    pub job_id: Uuid,
+    pub digest: [u8; 32],
+}
+
+/// Recent successful publications, in manifest order. Ordinary edits share the snapshot.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct TableCompactionReceipts(Arc<VecDeque<TableCompactionReceipt>>);
+
+impl TableCompactionReceipts {
+    const CAPACITY: usize = 4096;
+
+    pub(crate) fn get(&self, job_id: &Uuid) -> Option<&[u8; 32]> {
+        self.0
+            .iter()
+            .rev()
+            .find(|receipt| receipt.job_id == *job_id)
+            .map(|receipt| &receipt.digest)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn record(&mut self, receipt: TableCompactionReceipt) {
+        if self.get(&receipt.job_id).is_some() {
+            return;
+        }
+        let entries = Arc::make_mut(&mut self.0);
+        if entries.len() == Self::CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back(receipt);
+    }
 }
 
 /// Changes an edit makes to the WAL ranges the region still has to recover.
@@ -275,6 +319,9 @@ pub struct RegionManifest {
     /// The [HandoffFloor] of each node, removed once the flushed entry id reaches it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub handoff_floors: BTreeMap<u64, EntryId>,
+    /// A retry whose receipt has expired must revalidate the original inputs.
+    #[serde(default, skip_serializing_if = "TableCompactionReceipts::is_empty")]
+    pub table_compaction_receipts: TableCompactionReceipts,
 }
 
 impl RegionManifest {
@@ -322,6 +369,7 @@ impl PartialEq for RegionManifest {
             && self.committed_sequence == other.committed_sequence
             && self.pending_tails == other.pending_tails
             && self.handoff_floors == other.handoff_floors
+            && self.table_compaction_receipts == other.table_compaction_receipts
     }
 }
 
@@ -351,6 +399,7 @@ pub struct RegionManifestBuilder {
     append_mode: Option<bool>,
     pending_tails: Vec<PendingTail>,
     handoff_floors: BTreeMap<u64, EntryId>,
+    table_compaction_receipts: TableCompactionReceipts,
 }
 
 impl RegionManifestBuilder {
@@ -411,6 +460,7 @@ impl RegionManifestBuilder {
                 append_mode: s.append_mode,
                 pending_tails: s.pending_tails,
                 handoff_floors: s.handoff_floors,
+                table_compaction_receipts: s.table_compaction_receipts,
             }
         } else {
             Self::new(file_metadata_interner)
@@ -450,6 +500,9 @@ impl RegionManifestBuilder {
 
     pub fn apply_edit(&mut self, manifest_version: ManifestVersion, edit: RegionEdit) {
         self.manifest_version = manifest_version;
+        if let Some(receipt) = edit.table_compaction_receipt {
+            self.table_compaction_receipts.record(receipt);
+        }
 
         let mut removed_files = vec![];
         for file in edit.files_to_add {
@@ -593,6 +646,7 @@ impl RegionManifestBuilder {
             append_mode: self.append_mode,
             pending_tails: self.pending_tails,
             handoff_floors: self.handoff_floors,
+            table_compaction_receipts: self.table_compaction_receipts,
         })
     }
 }
@@ -1196,6 +1250,7 @@ mod tests {
             pending_tails: Default::default(),
             series_indexes: Default::default(),
             handoff_floors: Default::default(),
+            table_compaction_receipts: Default::default(),
         };
 
         let json = serde_json::to_string(&manifest).unwrap();
@@ -1382,6 +1437,7 @@ mod tests {
                 pending_tails: Default::default(),
                 series_indexes: Default::default(),
                 handoff_floors: Default::default(),
+                table_compaction_receipts: Default::default(),
             }
         );
 
@@ -1400,6 +1456,7 @@ mod tests {
             pending_tails: Default::default(),
             series_indexes: Default::default(),
             handoff_floors: Default::default(),
+            table_compaction_receipts: Default::default(),
         };
         let json = serde_json::to_string(&new_manifest).unwrap();
         let old_from_new: RegionManifestV1 = serde_json::from_str(&json).unwrap();
@@ -1932,6 +1989,26 @@ mod tests {
         for key in ["pending_tails", "handoff_floors"] {
             assert_eq!(encoded["checkpoint"][key], frozen["checkpoint"][key]);
         }
+    }
+
+    #[test]
+    fn table_compaction_receipts_evict_in_publication_order() {
+        let mut receipts = TableCompactionReceipts::default();
+        let receipt = |n| TableCompactionReceipt {
+            job_id: Uuid::from_u128(n),
+            digest: [7; 32],
+        };
+        for n in 0..TableCompactionReceipts::CAPACITY as u128 {
+            receipts.record(receipt(n));
+        }
+        // Replaying an identical edit does not refresh its position.
+        receipts.record(receipt(0));
+        let prior = receipts.clone();
+        receipts.record(receipt(TableCompactionReceipts::CAPACITY as u128));
+        assert_eq!(None, receipts.get(&Uuid::from_u128(0)));
+        assert_eq!(Some(&[7; 32]), receipts.get(&Uuid::from_u128(1)));
+        assert_eq!(Some(&[7; 32]), prior.get(&Uuid::from_u128(0)));
+        assert_eq!(TableCompactionReceipts::CAPACITY, receipts.0.len());
     }
 
     /// Checks the fixtures against the shapes before pending tails were added.
